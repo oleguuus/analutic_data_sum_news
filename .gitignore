@@ -9,3 +9,4 @@ __pycache__/
 
 # Output
 results.txt
+NEWS/results_*.txt
