@@ -24,11 +24,11 @@ else:
 
 
 NEWS_API_URL = "https://newsapi.org/v2/everything"
-DEFAULT_QUERY = "technology"
+TOP_HEADLINES_API_URL = "https://newsapi.org/v2/top-headlines"
+DEFAULT_QUERY = ""
 DEFAULT_PAGE_SIZE = 5
-RESULTS_FILE = "results.txt"
 SEPARATOR = "-" * 40
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,61 @@ def _parse_comma_list(value: str) -> list[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
 
+def _load_gemini_keys_from_env() -> list[str]:
+    """
+    Загружает Gemini ключи из GEMINI_API_KEYS или GEMINI_API_KEY.
+
+    Поддерживает как один ключ, так и список ключей через запятую в любом из
+    этих параметров, чтобы не зависеть от имени переменной в .env.
+    """
+    gemini_api_keys = (os.getenv("GEMINI_API_KEYS") or "").strip()
+    gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    # Сначала пробуем GEMINI_API_KEYS
+    if gemini_api_keys:
+        for key in _parse_comma_list(gemini_api_keys):
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+    # Затем GEMINI_API_KEY
+    if gemini_api_key:
+        for key in _parse_comma_list(gemini_api_key):
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+    return keys
+
+
+def _contains_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", text or ""))
+
+
+def _slugify_topic_for_filename(topic: str) -> str:
+    """
+    Нормализует тему для имени файла.
+    """
+    normalized = re.sub(r"\s+", "_", (topic or "").strip().lower())
+    normalized = re.sub(r"[^a-z0-9а-яё_-]", "", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        return "all_topics"
+    return normalized[:50]
+
+
+def build_results_file_path(topic: str) -> str:
+    """
+    Формирует путь к файлу в папке NEWS в формате NEWS/results_<topic>_<YYYYmmdd_HHMMSS>.txt.
+    """
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    topic_slug = _slugify_topic_for_filename(topic)
+    return os.path.join("NEWS", f"results_{topic_slug}_{stamp}.txt")
+
+
 def load_keys() -> tuple[Optional[str], list[str], str]:
     """
     Загружает ключи из .env.
@@ -78,14 +133,7 @@ def load_keys() -> tuple[Optional[str], list[str], str]:
     """
     load_dotenv()
     news_api_key = (os.getenv("NEWS_API_KEY") or "").strip() or None
-    gemini_keys: list[str] = []
-    gemini_keys_raw = (os.getenv("GEMINI_API_KEYS") or "").strip()
-    if gemini_keys_raw:
-        gemini_keys = _parse_comma_list(gemini_keys_raw)
-    else:
-        single = (os.getenv("GEMINI_API_KEY") or "").strip()
-        if single:
-            gemini_keys = [single]
+    gemini_keys = _load_gemini_keys_from_env()
     gemini_model = (os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     return news_api_key, gemini_keys, gemini_model
 
@@ -112,23 +160,36 @@ def fetch_latest_news(
     news_api_key: str,
     query: str = DEFAULT_QUERY,
     page_size: int = DEFAULT_PAGE_SIZE,
-    language: str = "en",
+    language: Optional[str] = "en",
     timeout_s: int = 20,
 ) -> list[NewsItem]:
     """
     Получает последние новости из NewsAPI и возвращает список NewsItem.
-    Забираем 3–5 новостей (page_size) по запросу query.
+    Если query пустой, возвращает общие топ-новости без фильтра по теме.
     """
-    params = {
-        "q": query,
-        "pageSize": max(1, min(page_size, 5)),
-        "sortBy": "publishedAt",
-        "language": language,
-    }
+    normalized_query = (query or "").strip()
+    page_size = max(1, min(page_size, 100))
+    if normalized_query:
+        url = NEWS_API_URL
+        params = {
+            "q": normalized_query,
+            "pageSize": page_size,
+            "sortBy": "publishedAt",
+        }
+        if language:
+            params["language"] = language
+    else:
+        # Пустая тема: берем общие top headlines.
+        url = TOP_HEADLINES_API_URL
+        params = {
+            "country": "us",
+            "pageSize": page_size,
+        }
+
     headers = {"X-Api-Key": news_api_key}
 
     try:
-        resp = requests.get(NEWS_API_URL, params=params, headers=headers, timeout=timeout_s)
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout_s)
     except requests.RequestException as e:
         _log(f"Ошибка сети при запросе NewsAPI: {e}")
         return []
@@ -310,7 +371,8 @@ def summarize_news_with_gemini(
     {
       "headline": "Краткий заголовок",
       "summary": "Саммари в 2-3 предложения",
-      "category": "Категория"
+            "category": "Категория",
+            "source_url": "Ссылка на первоисточник"
     }
     """
     if not news_text.strip():
@@ -350,6 +412,7 @@ def summarize_news_with_gemini(
             try:
                 model = genai.GenerativeModel(candidate)
                 resp = model.generate_content(prompt, generation_config=cfg)
+                _log(f"Gemini: использую модель {candidate!r} для этой новости.")
                 last_err = None
                 break
             except Exception as e:
@@ -359,18 +422,14 @@ def summarize_news_with_gemini(
                     break
 
                 if _looks_like_rate_limited(e):
-                    retry_s = _extract_retry_seconds(e)
-                    if retry_s is None:
-                        retry_s = 5.0
-                    retry_s = max(1.0, min(retry_s, 20.0))
-                    attempts_left -= 1
+                    # При лимитировании (429), сразу выбрасываем исключение
+                    # чтобы main() переключился на следующий API ключ
                     _log(
                         "Gemini ограничил запросы (429/quota). "
-                        f"Подожду {retry_s:.1f}s и попробую ещё раз... "
+                        "Переключаюсь на следующий API ключ. "
                         "Если лимит = 0, нужно включить квоту/биллинг в Google AI Studio."
                     )
-                    time.sleep(retry_s)
-                    continue
+                    raise
 
                 if _looks_like_invalid_api_key(e) or _looks_like_permission_denied(e):
                     # Это ошибка ключа/доступов — пусть верхний уровень попробует другой ключ
@@ -399,12 +458,13 @@ def summarize_news_with_gemini(
     headline = str(data.get("headline") or "").strip()
     summary = str(data.get("summary") or "").strip()
     category = str(data.get("category") or "").strip()
+    source_url = str(data.get("source_url") or "").strip()
 
     if not (headline and summary and category):
         _log(f"JSON от Gemini не содержит обязательных полей. Получено: {data}")
         return None
 
-    return {"headline": headline, "summary": summary, "category": category}
+    return {"headline": headline, "summary": summary, "category": category, "source_url": source_url}
 
 
 def append_result(path: str, item: dict[str, str]) -> None:
@@ -414,13 +474,83 @@ def append_result(path: str, item: dict[str, str]) -> None:
     category = item.get("category", "").strip() or "Без категории"
     headline = item.get("headline", "").strip() or "Без заголовка"
     summary = item.get("summary", "").strip() or ""
+    source_url = item.get("source_url", "").strip()
 
-    block = f"[{category}] {headline}\nСаммари: {summary}\n{SEPARATOR}\n"
+    block_lines = [f"[{category}] {headline}", f"Саммари: {summary}"]
+    if source_url:
+        block_lines.append(f"Источник: {source_url}")
+    block_lines.append(SEPARATOR)
+    block = "\n".join(block_lines) + "\n"
     try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(block)
     except OSError as e:
         _log(f"Ошибка записи в файл {path!r}: {e}")
+
+
+def prompt_user_query(default_query: str = DEFAULT_QUERY) -> str:
+    """
+    Спрашивает тему новостей у пользователя.
+    Пустой ввод означает режим без фильтра по теме.
+    """
+    prompt = "Введите тему новостей (Enter = без фильтра): "
+    try:
+        raw = input(prompt)
+    except EOFError:
+        return default_query
+
+    value = (raw or "").strip()
+    if value and _contains_cyrillic(value):
+        _log(
+            "Подсказка: тема введена на русском. NewsAPI чаще лучше работает с английскими ключевыми словами; "
+            "для русской темы будет включен language='ru'."
+        )
+    return value if value else default_query
+
+
+def choose_query_language(query: str) -> Optional[str]:
+    """
+    Подбирает language-параметр для NewsAPI.
+    """
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        return None
+    if _contains_cyrillic(normalized_query):
+        return "ru"
+    return "en"
+
+
+def prompt_user_page_size(default_page_size: int = DEFAULT_PAGE_SIZE) -> int:
+    """
+    Спрашивает количество новостей.
+    Пустой ввод = default_page_size.
+    """
+    while True:
+        prompt = f"Введите количество новостей (Enter = {default_page_size}): "
+        try:
+            raw = input(prompt)
+        except EOFError:
+            return default_page_size
+
+        value = (raw or "").strip()
+        if not value:
+            return default_page_size
+        try:
+            parsed = int(value)
+        except ValueError:
+            _log("Нужно ввести целое число.")
+            continue
+
+        if parsed < 1:
+            _log("Количество новостей должно быть >= 1.")
+            continue
+        if parsed > 100:
+            _log("NewsAPI поддерживает до 100 новостей за запрос. Беру 100.")
+            return 100
+        return parsed
 
 
 def main() -> int:
@@ -437,9 +567,25 @@ def main() -> int:
     model_candidates = _pick_fallback_model(gemini_model)
     _log(f"Кандидаты моделей Gemini: {model_candidates}")
     _log(f"Gemini ключей загружено: {len(gemini_keys)}")
+    if gemini_keys:
+        for idx, key in enumerate(gemini_keys, start=1):
+            key_preview = key[:10] + "..." if len(key) > 10 else key
+            _log(f"  Ключ {idx}: {key_preview}")
 
-    _log(f"Запрашиваю новости из NewsAPI (query={DEFAULT_QUERY!r})...")
-    news = fetch_latest_news(news_api_key, query=DEFAULT_QUERY, page_size=DEFAULT_PAGE_SIZE)
+    query = prompt_user_query()
+    page_size = prompt_user_page_size()
+    query_language = choose_query_language(query)
+    results_file = build_results_file_path(query)
+    if query:
+        _log(f"Выбрана тема новостей: {query!r}")
+    else:
+        _log("Тема не выбрана: запускаю без фильтра по теме (top headlines).")
+    _log(f"Запрошенное количество новостей: {page_size}")
+    _log(f"Параметр language для NewsAPI: {query_language!r}")
+    _log(f"Результат будет записан в новый файл: {results_file!r}")
+
+    _log("Запрашиваю новости из NewsAPI...")
+    news = fetch_latest_news(news_api_key, query=query, page_size=page_size, language=query_language)
     if not news:
         _log("Новости не получены (пусто или ошибка). Завершаю.")
         return 1
@@ -461,8 +607,8 @@ def main() -> int:
                 if result is not None:
                     break
             except Exception as e:
-                # Ошибки ключа/доступа: пробуем следующий ключ
-                if _looks_like_invalid_api_key(e) or _looks_like_permission_denied(e):
+                # Ошибки ключа/доступа, rate limiting: пробуем следующий ключ
+                if (_looks_like_invalid_api_key(e) or _looks_like_permission_denied(e) or _looks_like_rate_limited(e)):
                     _log(f"Проблема с Gemini ключом {key_idx}/{len(gemini_keys)}: {e}. Переключаюсь на следующий.")
                     continue
                 _log(f"Неожиданная ошибка при работе с ключом {key_idx}/{len(gemini_keys)}: {e}")
@@ -472,9 +618,12 @@ def main() -> int:
             _log(f"[{idx}/{len(news)}] Пропуск: не удалось получить валидный JSON.")
             continue
 
-        append_result(RESULTS_FILE, result)
+        if item.url and not result.get("source_url"):
+            result["source_url"] = item.url
+
+        append_result(results_file, result)
         processed += 1
-        _log(f"[{idx}/{len(news)}] OK: сохранено в {RESULTS_FILE!r}.")
+        _log(f"[{idx}/{len(news)}] OK: сохранено в {results_file!r}.")
 
         # Маленькая пауза, чтобы не упираться в лимиты слишком агрессивно
         time.sleep(0.5)
