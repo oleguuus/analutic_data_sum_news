@@ -310,6 +310,11 @@ def summarize_news_with_gemini(
     if not news_text.strip():
         return None
 
+    # Длинные статьи съедают лимит токенов и могут обрезать JSON в ответе
+    max_chars = int(os.getenv("GEMINI_MAX_NEWS_CHARS", "8000"))
+    if len(news_text) > max_chars:
+        news_text = news_text[:max_chars] + "\n...[текст обрезан для API]"
+
     prompt = (
         "Ты — новостной редактор. Прочитай новость и верни СТРОГО JSON (application/json), "
         "без markdown, без пояснений, без лишних ключей.\n\n"
@@ -324,10 +329,12 @@ def summarize_news_with_gemini(
         return None
 
     genai.configure(api_key=gemini_api_key)
+    # 400 токенов иногда даёт обрезанный JSON при application/json — увеличиваем лимит
+    max_out = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
     cfg = GenerationConfig(
         response_mime_type="application/json",
         temperature=0.2,
-        max_output_tokens=400,
+        max_output_tokens=max(256, min(max_out, 8192)),
     )
 
     last_err: Exception | None = None
