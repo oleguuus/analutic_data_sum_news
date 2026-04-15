@@ -62,21 +62,32 @@ def _ensure_utf8_console() -> None:
             pass
 
 
-def load_keys() -> tuple[Optional[str], Optional[str], str]:
+def _parse_comma_list(value: str) -> list[str]:
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def load_keys() -> tuple[Optional[str], list[str], str]:
     """
     Загружает ключи из .env.
 
     Ожидаемые переменные окружения:
     - NEWS_API_KEY
-    - GEMINI_API_KEY
+    - GEMINI_API_KEY или GEMINI_API_KEYS (список через запятую)
     Опционально:
     - GEMINI_MODEL (по умолчанию gemini-3.1-flash)
     """
     load_dotenv()
     news_api_key = os.getenv("NEWS_API_KEY")
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    gemini_keys: list[str] = []
+    gemini_keys_raw = (os.getenv("GEMINI_API_KEYS") or "").strip()
+    if gemini_keys_raw:
+        gemini_keys = _parse_comma_list(gemini_keys_raw)
+    else:
+        single = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if single:
+            gemini_keys = [single]
     gemini_model = (os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
-    return news_api_key, gemini_api_key, gemini_model
+    return news_api_key, gemini_keys, gemini_model
 
 
 def _pick_fallback_model(preferred: str) -> list[str]:
@@ -85,7 +96,13 @@ def _pick_fallback_model(preferred: str) -> list[str]:
     Возвращаем список кандидатов: сначала preferred, затем безопасные flash-альтернативы.
     """
     candidates = [preferred]
-    for name in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"):
+    for name in (
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+    ):
         if name not in candidates:
             candidates.append(name)
     return candidates
@@ -251,6 +268,16 @@ def _looks_like_rate_limited(err: Exception) -> bool:
     return "429" in msg or "quota exceeded" in msg or "rate limit" in msg
 
 
+def _looks_like_invalid_api_key(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "api key not valid" in msg or "api_key_invalid" in msg or "invalid api key" in msg
+
+
+def _looks_like_permission_denied(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "permission" in msg and ("denied" in msg or "forbidden" in msg)
+
+
 def _extract_retry_seconds(err: Exception) -> Optional[float]:
     """
     Пытаемся вытащить подсказку вида 'Please retry in 15.33s' из текста ошибки.
@@ -265,7 +292,11 @@ def _extract_retry_seconds(err: Exception) -> Optional[float]:
         return None
 
 
-def summarize_news_with_gemini(model_names: list[str], gemini_api_key: str, news_text: str) -> Optional[dict[str, str]]:
+def summarize_news_with_gemini(
+    model_names: list[str],
+    gemini_api_key: str,
+    news_text: str,
+) -> Optional[dict[str, str]]:
     """
     Отправляет текст новости в Gemini и возвращает строго структурированный результат.
 
@@ -328,6 +359,10 @@ def summarize_news_with_gemini(model_names: list[str], gemini_api_key: str, news
                     time.sleep(retry_s)
                     continue
 
+                if _looks_like_invalid_api_key(e) or _looks_like_permission_denied(e):
+                    # Это ошибка ключа/доступов — пусть верхний уровень попробует другой ключ
+                    raise
+
                 _log(f"Ошибка при вызове Gemini (модель {candidate!r}): {e}")
                 return None
 
@@ -377,17 +412,18 @@ def append_result(path: str, item: dict[str, str]) -> None:
 
 def main() -> int:
     _ensure_utf8_console()
-    news_api_key, gemini_api_key, gemini_model = load_keys()
+    news_api_key, gemini_keys, gemini_model = load_keys()
 
     if not news_api_key:
         _log("Не найден NEWS_API_KEY в .env (или переменных окружения).")
         return 2
-    if not gemini_api_key:
-        _log("Не найден GEMINI_API_KEY в .env (или переменных окружения).")
+    if not gemini_keys:
+        _log("Не найден GEMINI_API_KEY или GEMINI_API_KEYS в .env (или переменных окружения).")
         return 2
 
     model_candidates = _pick_fallback_model(gemini_model)
     _log(f"Кандидаты моделей Gemini: {model_candidates}")
+    _log(f"Gemini ключей загружено: {len(gemini_keys)}")
 
     _log(f"Запрашиваю новости из NewsAPI (query={DEFAULT_QUERY!r})...")
     news = fetch_latest_news(news_api_key, query=DEFAULT_QUERY, page_size=DEFAULT_PAGE_SIZE)
@@ -403,7 +439,22 @@ def main() -> int:
         _log(f"[{idx}/{len(news)}] Обрабатываю: {title_preview!r}")
 
         news_text = build_news_text(item)
-        result = summarize_news_with_gemini(model_candidates, gemini_api_key, news_text)
+        result: Optional[dict[str, str]] = None
+        for key_idx, key in enumerate(gemini_keys, start=1):
+            try:
+                if len(gemini_keys) > 1:
+                    _log(f"Gemini ключ {key_idx}/{len(gemini_keys)}: пробую запрос...")
+                result = summarize_news_with_gemini(model_candidates, key, news_text)
+                if result is not None:
+                    break
+            except Exception as e:
+                # Ошибки ключа/доступа: пробуем следующий ключ
+                if _looks_like_invalid_api_key(e) or _looks_like_permission_denied(e):
+                    _log(f"Проблема с Gemini ключом {key_idx}/{len(gemini_keys)}: {e}. Переключаюсь на следующий.")
+                    continue
+                _log(f"Неожиданная ошибка при работе с ключом {key_idx}/{len(gemini_keys)}: {e}")
+                break
+
         if result is None:
             _log(f"[{idx}/{len(news)}] Пропуск: не удалось получить валидный JSON.")
             continue
