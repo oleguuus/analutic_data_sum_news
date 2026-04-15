@@ -77,7 +77,7 @@ def load_keys() -> tuple[Optional[str], list[str], str]:
     - GEMINI_MODEL (по умолчанию gemini-3.1-flash)
     """
     load_dotenv()
-    news_api_key = os.getenv("NEWS_API_KEY")
+    news_api_key = (os.getenv("NEWS_API_KEY") or "").strip() or None
     gemini_keys: list[str] = []
     gemini_keys_raw = (os.getenv("GEMINI_API_KEYS") or "").strip()
     if gemini_keys_raw:
@@ -106,30 +106,6 @@ def _pick_fallback_model(preferred: str) -> list[str]:
         if name not in candidates:
             candidates.append(name)
     return candidates
-
-
-def configure_gemini(gemini_api_key: str, model_name: str) -> Any:
-    """
-    Настраивает клиент Google Gemini и возвращает объект модели.
-    """
-    if genai is None:
-        raise RuntimeError(
-            "Библиотека google-generativeai не импортировалась. "
-            "Проверьте установку зависимостей. "
-            f"Ошибка импорта: {_GENAI_IMPORT_ERROR!r}"
-        )
-
-    genai.configure(api_key=gemini_api_key)
-    last_error: Exception | None = None
-    for candidate in _pick_fallback_model(model_name):
-        try:
-            _log(f"Использую Gemini модель: {candidate!r}")
-            return genai.GenerativeModel(candidate)
-        except Exception as e:
-            last_error = e
-            _log(f"Не удалось создать модель {candidate!r}: {e}")
-
-    raise RuntimeError(f"Не удалось настроить Gemini модель. Последняя ошибка: {last_error}")
 
 
 def fetch_latest_news(
@@ -228,7 +204,44 @@ def build_news_text(item: NewsItem) -> str:
     return "\n".join(parts).strip()
 
 
-_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}$", flags=re.MULTILINE)
+def _get_env_int(name: str, default: int, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    """
+    Безопасно читает int из переменной окружения и ограничивает диапазон.
+    При невалидном значении пишет лог и использует default.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            _log(f"Невалидное значение {name}={raw!r}, использую {default}.")
+            value = default
+
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _extract_last_json_object(text: str) -> Optional[dict[str, Any]]:
+    """
+    Ищет последний валидный JSON-объект в произвольном тексте.
+    """
+    decoder = json.JSONDecoder()
+    last_obj: Optional[dict[str, Any]] = None
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            last_obj = obj
+    return last_obj
 
 
 def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
@@ -247,15 +260,8 @@ def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
-    # 2) Fallback: попытаться вытащить JSON-объект из конца ответа
-    m = _JSON_OBJECT_RE.search(text)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+    # 2) Fallback: попытаться найти последний валидный JSON-объект в тексте
+    return _extract_last_json_object(text)
 
 
 def _looks_like_model_not_found(err: Exception) -> bool:
@@ -311,7 +317,7 @@ def summarize_news_with_gemini(
         return None
 
     # Длинные статьи съедают лимит токенов и могут обрезать JSON в ответе
-    max_chars = int(os.getenv("GEMINI_MAX_NEWS_CHARS", "8000"))
+    max_chars = _get_env_int("GEMINI_MAX_NEWS_CHARS", 8000, min_value=500, max_value=50000)
     if len(news_text) > max_chars:
         news_text = news_text[:max_chars] + "\n...[текст обрезан для API]"
 
@@ -330,7 +336,7 @@ def summarize_news_with_gemini(
 
     genai.configure(api_key=gemini_api_key)
     # 400 токенов иногда даёт обрезанный JSON при application/json — увеличиваем лимит
-    max_out = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+    max_out = _get_env_int("GEMINI_MAX_OUTPUT_TOKENS", 2048, min_value=256, max_value=8192)
     cfg = GenerationConfig(
         response_mime_type="application/json",
         temperature=0.2,
