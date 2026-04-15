@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
+
+import requests
+from dotenv import load_dotenv
+
+try:
+    import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
+except Exception as e:  # pragma: no cover
+    genai = None  # type: ignore[assignment]
+    GenerationConfig = None  # type: ignore[assignment]
+    _GENAI_IMPORT_ERROR = e
+else:
+    _GENAI_IMPORT_ERROR = None
+
+
+NEWS_API_URL = "https://newsapi.org/v2/everything"
+DEFAULT_QUERY = "technology"
+DEFAULT_PAGE_SIZE = 5
+RESULTS_FILE = "results.txt"
+SEPARATOR = "-" * 40
+
+
+@dataclass(frozen=True)
+class NewsItem:
+    title: str
+    description: str
+    content: str
+    url: str
+    published_at: str
+    source: str
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _log(msg: str) -> None:
+    print(f"[{_now_iso()}] {msg}")
+
+
+def load_keys() -> tuple[Optional[str], Optional[str]]:
+    """
+    Загружает ключи из .env.
+
+    Ожидаемые переменные окружения:
+    - NEWS_API_KEY
+    - GEMINI_API_KEY
+    """
+    load_dotenv()
+    news_api_key = os.getenv("NEWS_API_KEY")
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    return news_api_key, gemini_api_key
+
+
+def configure_gemini(gemini_api_key: str) -> Any:
+    """
+    Настраивает клиент Google Gemini и возвращает объект модели.
+    """
+    if genai is None:
+        raise RuntimeError(
+            "Библиотека google-generativeai не импортировалась. "
+            "Проверьте установку зависимостей. "
+            f"Ошибка импорта: {_GENAI_IMPORT_ERROR!r}"
+        )
+
+    genai.configure(api_key=gemini_api_key)
+    return genai.GenerativeModel("gemini-3.1-flash")
+
+
+def fetch_latest_news(
+    news_api_key: str,
+    query: str = DEFAULT_QUERY,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    language: str = "en",
+    timeout_s: int = 20,
+) -> list[NewsItem]:
+    """
+    Получает последние новости из NewsAPI и возвращает список NewsItem.
+    Забираем 3–5 новостей (page_size) по запросу query.
+    """
+    params = {
+        "q": query,
+        "pageSize": max(1, min(page_size, 5)),
+        "sortBy": "publishedAt",
+        "language": language,
+    }
+    headers = {"X-Api-Key": news_api_key}
+
+    try:
+        resp = requests.get(NEWS_API_URL, params=params, headers=headers, timeout=timeout_s)
+    except requests.RequestException as e:
+        _log(f"Ошибка сети при запросе NewsAPI: {e}")
+        return []
+
+    if resp.status_code != 200:
+        try:
+            details = resp.json()
+        except Exception:
+            details = {"text": resp.text[:500]}
+        _log(f"NewsAPI вернул статус {resp.status_code}. Детали: {details}")
+        return []
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        _log(f"Не удалось распарсить ответ NewsAPI как JSON: {e}. Текст: {resp.text[:500]}")
+        return []
+
+    articles = payload.get("articles")
+    if not isinstance(articles, list):
+        _log(f"Неожиданный формат NewsAPI (articles): {type(articles)}")
+        return []
+
+    items: list[NewsItem] = []
+    for a in articles:
+        if not isinstance(a, dict):
+            continue
+        title = str(a.get("title") or "").strip()
+        description = str(a.get("description") or "").strip()
+        content = str(a.get("content") or "").strip()
+        url = str(a.get("url") or "").strip()
+        published_at = str(a.get("publishedAt") or "").strip()
+        source_obj = a.get("source") or {}
+        source = ""
+        if isinstance(source_obj, dict):
+            source = str(source_obj.get("name") or "").strip()
+
+        # Если совсем пусто — пропускаем
+        if not (title or description or content):
+            continue
+
+        items.append(
+            NewsItem(
+                title=title,
+                description=description,
+                content=content,
+                url=url,
+                published_at=published_at,
+                source=source,
+            )
+        )
+
+    return items
+
+
+def build_news_text(item: NewsItem) -> str:
+    """
+    Собирает единый текст новости для отправки в LLM.
+    """
+    parts: list[str] = []
+    if item.title:
+        parts.append(f"Title: {item.title}")
+    if item.description:
+        parts.append(f"Description: {item.description}")
+    if item.content:
+        parts.append(f"Content: {item.content}")
+    if item.source:
+        parts.append(f"Source: {item.source}")
+    if item.published_at:
+        parts.append(f"PublishedAt: {item.published_at}")
+    if item.url:
+        parts.append(f"URL: {item.url}")
+    return "\n".join(parts).strip()
+
+
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}$", flags=re.MULTILINE)
+
+
+def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
+    """
+    Пытается распарсить JSON максимально безопасно.
+    Возвращает словарь или None.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # 1) Прямая попытка
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Fallback: попытаться вытащить JSON-объект из конца ответа
+    m = _JSON_OBJECT_RE.search(text)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def summarize_news_with_gemini(model: Any, news_text: str) -> Optional[dict[str, str]]:
+    """
+    Отправляет текст новости в Gemini и возвращает строго структурированный результат.
+
+    Ожидаемый JSON:
+    {
+      "headline": "Краткий заголовок",
+      "summary": "Саммари в 2-3 предложения",
+      "category": "Категория"
+    }
+    """
+    if not news_text.strip():
+        return None
+
+    prompt = (
+        "Ты — новостной редактор. Прочитай новость и верни СТРОГО JSON (application/json), "
+        "без markdown, без пояснений, без лишних ключей.\n\n"
+        "Требуемая структура JSON:\n"
+        '{\"headline\":\"Краткий заголовок\",\"summary\":\"Саммари в 2-3 предложения\",\"category\":\"Категория\"}\n\n'
+        "Новость:\n"
+        f"{news_text}\n"
+    )
+
+    try:
+        cfg = GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=400,
+        )
+        resp = model.generate_content(prompt, generation_config=cfg)
+    except Exception as e:
+        _log(f"Ошибка при вызове Gemini: {e}")
+        return None
+
+    raw_text = ""
+    try:
+        raw_text = str(getattr(resp, "text", "") or "").strip()
+    except Exception:
+        raw_text = ""
+
+    data = _safe_json_loads(raw_text)
+    if data is None:
+        _log(f"Gemini вернул невалидный JSON. Ответ (обрезан): {raw_text[:300]!r}")
+        return None
+
+    headline = str(data.get("headline") or "").strip()
+    summary = str(data.get("summary") or "").strip()
+    category = str(data.get("category") or "").strip()
+
+    if not (headline and summary and category):
+        _log(f"JSON от Gemini не содержит обязательных полей. Получено: {data}")
+        return None
+
+    return {"headline": headline, "summary": summary, "category": category}
+
+
+def append_result(path: str, item: dict[str, str]) -> None:
+    """
+    Добавляет один результат в TXT-файл в читаемом формате.
+    """
+    category = item.get("category", "").strip() or "Без категории"
+    headline = item.get("headline", "").strip() or "Без заголовка"
+    summary = item.get("summary", "").strip() or ""
+
+    block = f"[{category}] {headline}\nСаммари: {summary}\n{SEPARATOR}\n"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(block)
+    except OSError as e:
+        _log(f"Ошибка записи в файл {path!r}: {e}")
+
+
+def main() -> int:
+    news_api_key, gemini_api_key = load_keys()
+
+    if not news_api_key:
+        _log("Не найден NEWS_API_KEY в .env (или переменных окружения).")
+        return 2
+    if not gemini_api_key:
+        _log("Не найден GEMINI_API_KEY в .env (или переменных окружения).")
+        return 2
+
+    try:
+        model = configure_gemini(gemini_api_key)
+    except Exception as e:
+        _log(f"Не удалось настроить Gemini: {e}")
+        return 2
+
+    _log(f"Запрашиваю новости из NewsAPI (query={DEFAULT_QUERY!r})...")
+    news = fetch_latest_news(news_api_key, query=DEFAULT_QUERY, page_size=DEFAULT_PAGE_SIZE)
+    if not news:
+        _log("Новости не получены (пусто или ошибка). Завершаю.")
+        return 1
+
+    _log(f"Получено новостей: {len(news)}. Начинаю саммаризацию...")
+
+    processed = 0
+    for idx, item in enumerate(news, start=1):
+        title_preview = (item.title or item.description or "")[:80]
+        _log(f"[{idx}/{len(news)}] Обрабатываю: {title_preview!r}")
+
+        news_text = build_news_text(item)
+        result = summarize_news_with_gemini(model, news_text)
+        if result is None:
+            _log(f"[{idx}/{len(news)}] Пропуск: не удалось получить валидный JSON.")
+            continue
+
+        append_result(RESULTS_FILE, result)
+        processed += 1
+        _log(f"[{idx}/{len(news)}] OK: сохранено в {RESULTS_FILE!r}.")
+
+        # Маленькая пауза, чтобы не упираться в лимиты слишком агрессивно
+        time.sleep(0.5)
+
+    _log(f"Готово. Успешно обработано: {processed}/{len(news)}.")
+    return 0 if processed > 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
