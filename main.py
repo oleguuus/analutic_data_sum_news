@@ -28,6 +28,7 @@ DEFAULT_QUERY = "technology"
 DEFAULT_PAGE_SIZE = 5
 RESULTS_FILE = "results.txt"
 SEPARATOR = "-" * 40
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash"
 
 
 @dataclass(frozen=True)
@@ -48,21 +49,49 @@ def _log(msg: str) -> None:
     print(f"[{_now_iso()}] {msg}")
 
 
-def load_keys() -> tuple[Optional[str], Optional[str]]:
+def _ensure_utf8_console() -> None:
+    """
+    На Windows консоль часто использует кодировку, из-за чего кириллица может отображаться как "����".
+    Здесь пытаемся принудительно переключить stdout/stderr на UTF-8.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def load_keys() -> tuple[Optional[str], Optional[str], str]:
     """
     Загружает ключи из .env.
 
     Ожидаемые переменные окружения:
     - NEWS_API_KEY
     - GEMINI_API_KEY
+    Опционально:
+    - GEMINI_MODEL (по умолчанию gemini-3.1-flash)
     """
     load_dotenv()
     news_api_key = os.getenv("NEWS_API_KEY")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
-    return news_api_key, gemini_api_key
+    gemini_model = (os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    return news_api_key, gemini_api_key, gemini_model
 
 
-def configure_gemini(gemini_api_key: str) -> Any:
+def _pick_fallback_model(preferred: str) -> list[str]:
+    """
+    На некоторых ключах/регионах конкретная модель может быть недоступна.
+    Возвращаем список кандидатов: сначала preferred, затем безопасные flash-альтернативы.
+    """
+    candidates = [preferred]
+    for name in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"):
+        if name not in candidates:
+            candidates.append(name)
+    return candidates
+
+
+def configure_gemini(gemini_api_key: str, model_name: str) -> Any:
     """
     Настраивает клиент Google Gemini и возвращает объект модели.
     """
@@ -74,7 +103,16 @@ def configure_gemini(gemini_api_key: str) -> Any:
         )
 
     genai.configure(api_key=gemini_api_key)
-    return genai.GenerativeModel("gemini-3.1-flash")
+    last_error: Exception | None = None
+    for candidate in _pick_fallback_model(model_name):
+        try:
+            _log(f"Использую Gemini модель: {candidate!r}")
+            return genai.GenerativeModel(candidate)
+        except Exception as e:
+            last_error = e
+            _log(f"Не удалось создать модель {candidate!r}: {e}")
+
+    raise RuntimeError(f"Не удалось настроить Gemini модель. Последняя ошибка: {last_error}")
 
 
 def fetch_latest_news(
@@ -203,7 +241,31 @@ def _safe_json_loads(text: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def summarize_news_with_gemini(model: Any, news_text: str) -> Optional[dict[str, str]]:
+def _looks_like_model_not_found(err: Exception) -> bool:
+    msg = str(err).lower()
+    return ("404" in msg and "not found" in msg) or ("is not found" in msg) or ("model" in msg and "not found" in msg)
+
+
+def _looks_like_rate_limited(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "429" in msg or "quota exceeded" in msg or "rate limit" in msg
+
+
+def _extract_retry_seconds(err: Exception) -> Optional[float]:
+    """
+    Пытаемся вытащить подсказку вида 'Please retry in 15.33s' из текста ошибки.
+    """
+    msg = str(err)
+    m = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def summarize_news_with_gemini(model_names: list[str], gemini_api_key: str, news_text: str) -> Optional[dict[str, str]]:
     """
     Отправляет текст новости в Gemini и возвращает строго структурированный результат.
 
@@ -226,15 +288,53 @@ def summarize_news_with_gemini(model: Any, news_text: str) -> Optional[dict[str,
         f"{news_text}\n"
     )
 
-    try:
-        cfg = GenerationConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-            max_output_tokens=400,
-        )
-        resp = model.generate_content(prompt, generation_config=cfg)
-    except Exception as e:
-        _log(f"Ошибка при вызове Gemini: {e}")
+    if genai is None or GenerationConfig is None:
+        _log("Gemini библиотека недоступна (google-generativeai не импортировалась).")
+        return None
+
+    genai.configure(api_key=gemini_api_key)
+    cfg = GenerationConfig(
+        response_mime_type="application/json",
+        temperature=0.2,
+        max_output_tokens=400,
+    )
+
+    last_err: Exception | None = None
+    for candidate in model_names:
+        attempts_left = 2
+        while attempts_left > 0:
+            try:
+                model = genai.GenerativeModel(candidate)
+                resp = model.generate_content(prompt, generation_config=cfg)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if _looks_like_model_not_found(e):
+                    _log(f"Модель {candidate!r} недоступна, пробую следующую...")
+                    break
+
+                if _looks_like_rate_limited(e):
+                    retry_s = _extract_retry_seconds(e)
+                    if retry_s is None:
+                        retry_s = 5.0
+                    retry_s = max(1.0, min(retry_s, 20.0))
+                    attempts_left -= 1
+                    _log(
+                        "Gemini ограничил запросы (429/quota). "
+                        f"Подожду {retry_s:.1f}s и попробую ещё раз... "
+                        "Если лимит = 0, нужно включить квоту/биллинг в Google AI Studio."
+                    )
+                    time.sleep(retry_s)
+                    continue
+
+                _log(f"Ошибка при вызове Gemini (модель {candidate!r}): {e}")
+                return None
+
+        if last_err is None:
+            break
+    else:
+        _log(f"Не удалось вызвать Gemini ни на одной модели. Последняя ошибка: {last_err}")
         return None
 
     raw_text = ""
@@ -276,7 +376,8 @@ def append_result(path: str, item: dict[str, str]) -> None:
 
 
 def main() -> int:
-    news_api_key, gemini_api_key = load_keys()
+    _ensure_utf8_console()
+    news_api_key, gemini_api_key, gemini_model = load_keys()
 
     if not news_api_key:
         _log("Не найден NEWS_API_KEY в .env (или переменных окружения).")
@@ -285,11 +386,8 @@ def main() -> int:
         _log("Не найден GEMINI_API_KEY в .env (или переменных окружения).")
         return 2
 
-    try:
-        model = configure_gemini(gemini_api_key)
-    except Exception as e:
-        _log(f"Не удалось настроить Gemini: {e}")
-        return 2
+    model_candidates = _pick_fallback_model(gemini_model)
+    _log(f"Кандидаты моделей Gemini: {model_candidates}")
 
     _log(f"Запрашиваю новости из NewsAPI (query={DEFAULT_QUERY!r})...")
     news = fetch_latest_news(news_api_key, query=DEFAULT_QUERY, page_size=DEFAULT_PAGE_SIZE)
@@ -305,7 +403,7 @@ def main() -> int:
         _log(f"[{idx}/{len(news)}] Обрабатываю: {title_preview!r}")
 
         news_text = build_news_text(item)
-        result = summarize_news_with_gemini(model, news_text)
+        result = summarize_news_with_gemini(model_candidates, gemini_api_key, news_text)
         if result is None:
             _log(f"[{idx}/{len(news)}] Пропуск: не удалось получить валидный JSON.")
             continue
