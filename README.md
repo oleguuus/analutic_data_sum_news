@@ -102,3 +102,19 @@ python .\main.py
 
 - Если видишь `429` или `Quota exceeded`, у ключа Gemini не включена квота или биллинг.
 - Если новости не сохраняются, проверь наличие папки `NEWS` и права на запись.
+
+## Пример запроса на тему "CAR"
+
+```text
+[Automotive] 2008 Chevrolet Corvette Z06 Track Car at No Reserve
+Саммари: This 2008 Chevrolet Corvette Z06 was extensively modified for track use under previous ownership. In 2025, it received approximately $40,000 in upgrades, including a rebuilt 7.0-liter LS7 V8 engine, an RPS twin-disc clutch, overhauled brakes, and new sway bars.
+Источник: https://bringatrailer.com/listing/2008-chevrolet-corvette-z06-76/
+----------------------------------------
+[Economy] Gig workers trapped by soaring gas prices
+Саммари: Gig workers, including rideshare drivers and food couriers, are facing significant financial strain due to soaring gas prices, which places the entire burden of increased costs on them. Many feel trapped by this situation, exacerbated by ongoing global conflicts.
+Источник: https://finance.yahoo.com/economy/articles/no-choice-gig-workers-trapped-122500268.html
+----------------------------------------
+```
+
+
+
