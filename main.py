@@ -13,11 +13,11 @@ import requests
 from dotenv import load_dotenv
 
 try:
-    import google.generativeai as genai
-    from google.generativeai.types import GenerationConfig
+    from google import genai
+    from google.genai import types as genai_types
 except Exception as e:  # pragma: no cover
     genai = None  # type: ignore[assignment]
-    GenerationConfig = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
     _GENAI_IMPORT_ERROR = e
 else:
     _GENAI_IMPORT_ERROR = None
@@ -29,6 +29,7 @@ DEFAULT_QUERY = ""
 DEFAULT_PAGE_SIZE = 5
 SEPARATOR = "-" * 40
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_RETRY_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,22 @@ class NewsItem:
     url: str
     published_at: str
     source: str
+
+
+def _build_gemini_response_schema() -> Any:
+    if genai_types is None:
+        return None
+
+    return genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "headline": genai_types.Schema(type=genai_types.Type.STRING),
+            "summary": genai_types.Schema(type=genai_types.Type.STRING),
+            "category": genai_types.Schema(type=genai_types.Type.STRING),
+        },
+        required=["headline", "summary", "category"],
+        property_ordering=["headline", "summary", "category"],
+    )
 
 
 def _now_iso() -> str:
@@ -114,11 +131,11 @@ def _slugify_topic_for_filename(topic: str) -> str:
 
 def build_results_file_path(topic: str) -> str:
     """
-    Формирует путь к файлу в папке NEWS в формате NEWS/results_<topic>_<YYYYmmdd_HHMMSS>.txt.
+    Формирует путь к файлу в папке NEWS в формате NEWS/results_<topic>_<YYYYmmdd_HHMMSS>.json.
     """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     topic_slug = _slugify_topic_for_filename(topic)
-    return os.path.join("NEWS", f"results_{topic_slug}_{stamp}.txt")
+    return os.path.join("NEWS", f"results_{topic_slug}_{stamp}.json")
 
 
 def load_keys() -> tuple[Optional[str], list[str], str]:
@@ -199,7 +216,7 @@ def fetch_latest_news(
             details = resp.json()
         except Exception:
             details = {"text": resp.text[:500]}
-        _log(f"NewsAPI вернул статус {resp.status_code}. Детали: {details}")
+        _log_newsapi_http_error(resp.status_code, details)
         return []
 
     try:
@@ -345,6 +362,25 @@ def _looks_like_permission_denied(err: Exception) -> bool:
     return "permission" in msg and ("denied" in msg or "forbidden" in msg)
 
 
+def _newsapi_error_label(status_code: int) -> str:
+    if status_code == 401:
+        return "auth"
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 429:
+        return "rate_limit"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "unexpected"
+
+
+def _log_newsapi_http_error(status_code: int, details: Any) -> None:
+    label = _newsapi_error_label(status_code)
+    _log(f"NewsAPI [{label}] вернул статус {status_code}. Детали: {details}")
+
+
 def _extract_retry_seconds(err: Exception) -> Optional[float]:
     """
     Пытаемся вытащить подсказку вида 'Please retry in 15.33s' из текста ошибки.
@@ -367,12 +403,11 @@ def summarize_news_with_gemini(
     """
     Отправляет текст новости в Gemini и возвращает строго структурированный результат.
 
-    Ожидаемый JSON:
+    Возвращаемая структура:
     {
       "headline": "Краткий заголовок",
       "summary": "Саммари в 2-3 предложения",
-            "category": "Категория",
-            "source_url": "Ссылка на первоисточник"
+      "category": "Категория"
     }
     """
     if not news_text.strip():
@@ -384,56 +419,77 @@ def summarize_news_with_gemini(
         news_text = news_text[:max_chars] + "\n...[текст обрезан для API]"
 
     prompt = (
-        "Ты — новостной редактор. Прочитай новость и верни СТРОГО JSON (application/json), "
-        "без markdown, без пояснений, без лишних ключей.\n\n"
-        "Требуемая структура JSON:\n"
-        '{\"headline\":\"Краткий заголовок\",\"summary\":\"Саммари в 2-3 предложения\",\"category\":\"Категория\"}\n\n'
+        "Роль: ты новостной редактор.\n"
+        "Задача: прочитай новость и подготовь краткое структурированное описание.\n"
+        "Требуемая структура:\n"
+        "- headline: краткий заголовок\n"
+        "- summary: саммари в 2-3 предложения\n"
+        "- category: категория новости\n\n"
         "Новость:\n"
         f"{news_text}\n"
     )
 
-    if genai is None or GenerationConfig is None:
+    if genai is None or genai_types is None:
         _log("Gemini библиотека недоступна (google-generativeai не импортировалась).")
         return None
 
-    genai.configure(api_key=gemini_api_key)
-    # 400 токенов иногда даёт обрезанный JSON при application/json — увеличиваем лимит
+    client = genai.Client(api_key=gemini_api_key)
+    # Structured output: API сам валидирует формат по response_schema.
     max_out = _get_env_int("GEMINI_MAX_OUTPUT_TOKENS", 2048, min_value=256, max_value=8192)
-    cfg = GenerationConfig(
+    cfg = genai_types.GenerateContentConfig(
         response_mime_type="application/json",
+        response_schema=_build_gemini_response_schema(),
         temperature=0.2,
         max_output_tokens=max(256, min(max_out, 8192)),
     )
 
     last_err: Exception | None = None
+    retry_attempts = _get_env_int(
+        "GEMINI_RETRY_ATTEMPTS",
+        DEFAULT_GEMINI_RETRY_ATTEMPTS,
+        min_value=1,
+        max_value=5,
+    )
     for candidate in model_names:
-        attempts_left = 2
+        attempts_left = retry_attempts
         while attempts_left > 0:
             try:
-                model = genai.GenerativeModel(candidate)
-                resp = model.generate_content(prompt, generation_config=cfg)
+                resp = client.models.generate_content(model=candidate, contents=prompt, config=cfg)
                 _log(f"Gemini: использую модель {candidate!r} для этой новости.")
                 last_err = None
                 break
             except Exception as e:
                 last_err = e
+                attempts_left -= 1
                 if _looks_like_model_not_found(e):
                     _log(f"Модель {candidate!r} недоступна, пробую следующую...")
                     break
 
                 if _looks_like_rate_limited(e):
-                    # При лимитировании (429), сразу выбрасываем исключение
-                    # чтобы main() переключился на следующий API ключ
+                    # При лимитировании даём шанс повторить тот же ключ, а затем
+                    # позволяем верхнему уровню переключиться на следующий ключ.
+                    retry_seconds = _extract_retry_seconds(e) or min(5.0, 2.0 ** (retry_attempts - attempts_left))
                     _log(
                         "Gemini ограничил запросы (429/quota). "
-                        "Переключаюсь на следующий API ключ. "
-                        "Если лимит = 0, нужно включить квоту/биллинг в Google AI Studio."
+                        f"Повтор через {retry_seconds:.2f}s, если попытки еще остались."
                     )
+                    if attempts_left > 0:
+                        time.sleep(retry_seconds)
+                        continue
                     raise
 
                 if _looks_like_invalid_api_key(e) or _looks_like_permission_denied(e):
                     # Это ошибка ключа/доступов — пусть верхний уровень попробует другой ключ
                     raise
+
+                if attempts_left > 0:
+                    retry_seconds = _extract_retry_seconds(e) or 1.0
+                    _log(
+                        f"Ошибка при вызове Gemini (модель {candidate!r}): {e}. "
+                        f"Повтор через {retry_seconds:.2f}s."
+                    )
+                    time.sleep(retry_seconds)
+                    continue
 
                 _log(f"Ошибка при вызове Gemini (модель {candidate!r}): {e}")
                 return None
@@ -444,49 +500,44 @@ def summarize_news_with_gemini(
         _log(f"Не удалось вызвать Gemini ни на одной модели. Последняя ошибка: {last_err}")
         return None
 
-    raw_text = ""
-    try:
-        raw_text = str(getattr(resp, "text", "") or "").strip()
-    except Exception:
-        raw_text = ""
+    data: Optional[dict[str, Any]] = None
+    parsed = getattr(resp, "parsed", None)
+    if isinstance(parsed, dict):
+        data = parsed
 
-    data = _safe_json_loads(raw_text)
     if data is None:
-        _log(f"Gemini вернул невалидный JSON. Ответ (обрезан): {raw_text[:300]!r}")
-        return None
+        raw_text = ""
+        try:
+            raw_text = str(getattr(resp, "text", "") or "").strip()
+        except Exception:
+            raw_text = ""
+        data = _safe_json_loads(raw_text)
+        if data is None:
+            _log(f"Gemini вернул невалидный JSON. Ответ (обрезан): {raw_text[:300]!r}")
+            return None
 
     headline = str(data.get("headline") or "").strip()
     summary = str(data.get("summary") or "").strip()
     category = str(data.get("category") or "").strip()
-    source_url = str(data.get("source_url") or "").strip()
 
     if not (headline and summary and category):
         _log(f"JSON от Gemini не содержит обязательных полей. Получено: {data}")
         return None
 
-    return {"headline": headline, "summary": summary, "category": category, "source_url": source_url}
+    return {"headline": headline, "summary": summary, "category": category, "source_url": ""}
 
 
-def append_result(path: str, item: dict[str, str]) -> None:
+def write_results_json(path: str, items: list[dict[str, str]]) -> None:
     """
-    Добавляет один результат в TXT-файл в читаемом формате.
+    Записывает весь результат в JSON-файл.
     """
-    category = item.get("category", "").strip() or "Без категории"
-    headline = item.get("headline", "").strip() or "Без заголовка"
-    summary = item.get("summary", "").strip() or ""
-    source_url = item.get("source_url", "").strip()
-
-    block_lines = [f"[{category}] {headline}", f"Саммари: {summary}"]
-    if source_url:
-        block_lines.append(f"Источник: {source_url}")
-    block_lines.append(SEPARATOR)
-    block = "\n".join(block_lines) + "\n"
     try:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(block)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+            f.write("\n")
     except OSError as e:
         _log(f"Ошибка записи в файл {path!r}: {e}")
 
@@ -592,7 +643,7 @@ def main() -> int:
 
     _log(f"Получено новостей: {len(news)}. Начинаю саммаризацию...")
 
-    processed = 0
+    results: list[dict[str, str]] = []
     for idx, item in enumerate(news, start=1):
         title_preview = (item.title or item.description or "")[:80]
         _log(f"[{idx}/{len(news)}] Обрабатываю: {title_preview!r}")
@@ -621,17 +672,16 @@ def main() -> int:
         if item.url and not result.get("source_url"):
             result["source_url"] = item.url
 
-        append_result(results_file, result)
-        processed += 1
+        results.append(result)
+        write_results_json(results_file, results)
         _log(f"[{idx}/{len(news)}] OK: сохранено в {results_file!r}.")
 
         # Маленькая пауза, чтобы не упираться в лимиты слишком агрессивно
         time.sleep(0.5)
 
-    _log(f"Готово. Успешно обработано: {processed}/{len(news)}.")
-    return 0 if processed > 0 else 1
+    _log(f"Готово. Успешно обработано: {len(results)}/{len(news)}.")
+    return 0 if results else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
